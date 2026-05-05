@@ -56,8 +56,15 @@ def build():
     add_data_args = []
     data_dir = SCRIPT_DIR / 'data'
     if data_dir.exists():
-        add_data_args = ['--add-data', f'{data_dir};data']
+        add_data_args += ['--add-data', f'{data_dir};data']
         print(f"  Bundling word lists from: {data_dir}")
+
+    hebrew_wordlist = SCRIPT_DIR / 'hebrew_words.txt'
+    if hebrew_wordlist.exists():
+        add_data_args += ['--add-data', f'{hebrew_wordlist};.']
+        print(f"  Bundling Hebrew dictionary: {hebrew_wordlist} ({hebrew_wordlist.stat().st_size // 1024} KB)")
+    else:
+        print("  WARNING: hebrew_words.txt not found — run download_hebrew_dict.py first")
 
     version_file = SCRIPT_DIR / 'version_info.txt'
 

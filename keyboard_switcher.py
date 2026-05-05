@@ -22,6 +22,7 @@ import sys
 import os
 import winsound
 import winreg
+import urllib.request
 from pathlib import Path
 from pynput import keyboard as pynput_keyboard
 
@@ -43,6 +44,13 @@ HEB_TO_ENG = {v: k for k, v in ENG_TO_HEB.items() if v.isalpha()}
 # Character sets
 HEBREW_CHARS = set('אבגדהוזחטיכלמנסעפצקרשתךםןףץ')
 ENGLISH_CHARS = set('abcdefghijklmnopqrstuvwxyz')
+
+# Punctuation keys that, when typed on English layout, produce Hebrew letters
+# (e.g., ',' → 'ת', '.' → 'ץ', ';' → 'ף')
+PUNCT_TO_HEB = frozenset(
+    k for k, v in ENG_TO_HEB.items()
+    if v in HEBREW_CHARS and k not in ENGLISH_CHARS
+)
 
 # ─── Windows API ──────────────────────────────────────────────────────────────
 
@@ -141,46 +149,6 @@ def switch_to_hebrew_for(hwnd):
 
 # ─── Dictionary Loading ───────────────────────────────────────────────────────
 
-def _try_windows_spell_api(lang_tag):
-    """Use Windows built-in Spell Checking API (Windows 8+, via COM)."""
-    try:
-        import win32com.client
-        import pythoncom
-        pythoncom.CoInitialize()
-
-        factory = win32com.client.Dispatch("{7AB36653-1796-484B-BDFA-E74F1DB7C1DC}")
-
-        if not factory.IsSupported(lang_tag):
-            print(f"[Dict] Windows spell checker: {lang_tag} not installed as language pack")
-            return None
-
-        checker = factory.CreateSpellChecker(lang_tag)
-
-        def check_word(word):
-            try:
-                enum_errors = checker.Check(word)
-                try:
-                    error = enum_errors.Next()
-                    return error is None
-                except Exception:
-                    return len(list(enum_errors)) == 0
-            except Exception:
-                return False
-
-        # Sanity test
-        test = "hello" if "en" in lang_tag.lower() else "שלום"
-        if check_word(test):
-            print(f"[Dict] Using Windows Spell Checker ({lang_tag})")
-            return check_word
-
-        print(f"[Dict] Windows Spell Checker ({lang_tag}) sanity test failed")
-        return None
-
-    except Exception as e:
-        print(f"[Dict] Windows Spell Checker unavailable: {e}")
-        return None
-
-
 def load_english_dict():
     # 1. pyspellchecker — comprehensive offline English dictionary (82k+ words)
     try:
@@ -191,12 +159,7 @@ def load_english_dict():
     except Exception:
         pass
 
-    # 2. Windows Spell Checking API
-    checker = _try_windows_spell_api("en-US")
-    if checker:
-        return checker
-
-    # 3. pyenchant
+    # 2. pyenchant
     try:
         import enchant
         d = enchant.Dict("en_US")
@@ -205,7 +168,7 @@ def load_english_dict():
     except Exception:
         pass
 
-    # 4. Local wordlist file
+    # 3. Local wordlist file
     wordlist_path = Path(__file__).parent / 'data' / 'english_words.txt'
     if wordlist_path.exists():
         with open(wordlist_path, 'r', encoding='utf-8') as f:
@@ -251,13 +214,101 @@ def load_english_dict():
     return lambda word: word.lower() in COMMON_ENGLISH
 
 
-def load_hebrew_dict():
-    # 1. Windows Spell Checking API (requires Hebrew language pack installed)
-    checker = _try_windows_spell_api("he-IL")
-    if checker:
-        return checker
+# URL to the Hunspell Hebrew dictionary (wooorm/dictionaries, highly stable)
+_HEBREW_WORDLIST_URL = (
+    "https://raw.githubusercontent.com/wooorm/dictionaries/main/dictionaries/he/index.dic"
+)
 
-    # 2. pyenchant
+def _hebrew_cache_path():
+    appdata = os.environ.get('APPDATA') or str(Path.home() / 'AppData' / 'Roaming')
+    cache_dir = Path(appdata) / 'KeyboardFixer'
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / 'hebrew_words.txt'
+
+
+def _parse_wordlist(path):
+    """Read a pre-parsed plain wordlist (one word per line) into a set."""
+    with open(path, 'r', encoding='utf-8') as f:
+        return set(line.strip() for line in f if line.strip())
+
+
+def _parse_dic_content(content):
+    """Parse Hunspell .dic format: skip first line (count), strip affix rules."""
+    words = set()
+    for line in content.splitlines()[1:]:
+        word = line.split('/')[0].strip()
+        if word and not word.isdigit():
+            words.add(word)
+    return words
+
+
+def _load_or_download_hebrew_wordlist():
+    """Return a set of Hebrew words. Priority:
+    1. Bundled inside the frozen EXE (sys._MEIPASS)
+    2. Local project directory (development / script mode)
+    3. AppData cache (pre-parsed, written after first download)
+    4. Download from URL → parse → save to AppData cache
+    """
+    # 1. Bundled file inside PyInstaller _MEIPASS
+    if getattr(sys, 'frozen', False):
+        bundled = Path(sys._MEIPASS) / 'hebrew_words.txt'
+        if bundled.exists():
+            try:
+                words = _parse_wordlist(bundled)
+                if words:
+                    print(f"[Dict] Loaded {len(words):,} Hebrew words (bundled)")
+                    return words
+            except Exception:
+                pass
+
+    # 2. Local project directory (running as .py script)
+    local = Path(__file__).parent / 'hebrew_words.txt'
+    if local.exists():
+        try:
+            words = _parse_wordlist(local)
+            if words:
+                print(f"[Dict] Loaded {len(words):,} Hebrew words (local)")
+                return words
+        except Exception:
+            pass
+
+    # 3. AppData cache (pre-parsed plain text saved after first download)
+    cache = _hebrew_cache_path()
+    if cache.exists():
+        try:
+            words = _parse_wordlist(cache)
+            if words:
+                print(f"[Dict] Loaded {len(words):,} Hebrew words from cache")
+                return words
+        except Exception:
+            pass
+
+    # 4. Download, parse, and cache for next time
+    try:
+        req = urllib.request.Request(
+            _HEBREW_WORDLIST_URL,
+            headers={'User-Agent': 'KeyboardFixer/1.0'}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            content = resp.read().decode('utf-8', errors='ignore')
+        words = _parse_dic_content(content)
+        if words:
+            cache.write_text('\n'.join(sorted(words)), encoding='utf-8')
+            print(f"[Dict] Downloaded and cached {len(words):,} Hebrew words")
+            return words
+    except Exception as e:
+        print(f"[Dict] Hebrew wordlist download failed: {e}")
+
+    return None
+
+
+def load_hebrew_dict():
+    # 1. Cached / downloaded wordlist — offline-capable after first run
+    words = _load_or_download_hebrew_wordlist()
+    if words:
+        return lambda word: word in words
+
+    # 2. pyenchant (optional system dependency)
     try:
         import enchant
         d = enchant.Dict("he_IL")
@@ -266,14 +317,7 @@ def load_hebrew_dict():
     except Exception:
         pass
 
-    # 3. Local wordlist file
-    wordlist_path = Path(__file__).parent / 'data' / 'hebrew_words.txt'
-    if wordlist_path.exists():
-        with open(wordlist_path, 'r', encoding='utf-8') as f:
-            words = set(line.strip() for line in f if line.strip())
-        print(f"[Dict] Loaded {len(words):,} Hebrew words from file")
-        return lambda word: word in words
-
+    # 3. Minimal hardcoded fallback
     print("[Dict] Using built-in minimal Hebrew word list")
     COMMON_HEBREW = set("""
     אני את אתה הוא היא אנחנו אתם הם
@@ -334,6 +378,14 @@ class WordChecker:
     def all_english(self, text):
         return bool(text) and all(c.lower() in ENGLISH_CHARS for c in text if not c.isspace())
 
+    def _all_hebrew_key_chars(self, text):
+        """True if every char is either an English letter or a punctuation key that
+        maps to a Hebrew letter (e.g. ',' → ת, '.' → ץ, ';' → ף)."""
+        return bool(text) and all(
+            c.lower() in ENGLISH_CHARS or c in PUNCT_TO_HEB
+            for c in text if not c.isspace()
+        )
+
     def analyze(self, text):
         """
         Given typed text, determine if a fix is needed.
@@ -359,9 +411,10 @@ class WordChecker:
                 return ('hebrew_is_actually_english', text, converted)
             return None
 
-        # Case B: all English chars on screen
-        if self.all_english(text):
-            if self.is_english_word(text):
+        # Case B: chars are English letters and/or punctuation keys that map to Hebrew
+        # (handles words like "kt," where ',' → 'ת' under Hebrew mapping)
+        if self._all_hebrew_key_chars(text):
+            if self.all_english(text) and self.is_english_word(text):
                 return None  # legitimate English word, no fix
             converted = self.convert_eng_to_heb(text)
             if self.all_hebrew(converted) and self.is_hebrew_word(converted):
